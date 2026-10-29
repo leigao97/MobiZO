@@ -1,0 +1,15 @@
+# torch/torchvision CPU wheels are installed separately by setup_host.sh.
+executorch==1.0.1
+cmake==3.31.10
+ninja==1.13.2
+pybind11==3.1.0
+transformers==4.57.1
+sentencepiece==0.2.2
+safetensors==0.8.0
+packaging>=24.2
+pip>=23
+pyyaml
+setuptools>=77.0.3
+wheel
+zstd
+certifi

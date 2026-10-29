@@ -1,47 +1,23 @@
-if [ -z "$QNN_SDK_ROOT" ]; then
-    echo "Error: QNN_SDK_ROOT is not set."
-    exit 1
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+cd "$EXECUTORCH_ROOT"
+args=(--release --job_number "${MOBIZO_BUILD_JOBS:-24}")
+# Upstream --no_clean assumes both flatcc build directories already exist.
+if [[ -d build-x86/third-party/flatcc && -d build-android/third-party/flatcc ]]; then
+  args+=(--no_clean)
 fi
-
-if [ -z "$ANDROID_NDK_ROOT" ]; then
-    echo "Error: ANDROID_NDK_ROOT is not set."
-    exit 1
-fi
-
-if [ -z "$EXECUTORCH_ROOT" ]; then
-    echo "Error: EXECUTORCH_ROOT is not set."
-    exit 1
-fi
-
-if [ -z "$LD_LIBRARY_PATH" ]; then
-    echo "Error: LD_LIBRARY_PATH is not set."
-    exit 1
-fi
-
-if [ -z "$PYTHONPATH" ]; then
-    echo "Error: PYTHONPATH is not set."
-    exit 1
-fi
-
-cp ./custom_kernels/op_randn.cpp $EXECUTORCH_ROOT/kernels/portable/cpu/
-declaration="
-- op: randn.out
-  kernels:
-    - arg_meta: null
-      kernel_name: torch::executor::randn_out
-  tags: nondeterministic_seeded"
-
-file="$EXECUTORCH_ROOT/kernels/portable/functions.yaml"
-if ! grep -q "randn.out" "$file"; then
-  # If not, append the declaration to the file
-  echo "$declaration" >> "$file"
-  echo "randn op declaration appended to the file."
-else
-  echo "randn op declaration already exists in the file."
-fi
-
-cd $EXECUTORCH_ROOT
-git submodule sync
-git submodule update --init --recursive
-./backends/qualcomm/scripts/build.sh
-
+bash backends/qualcomm/scripts/build.sh "${args[@]}"
+cd "$MOBIZO_ROOT"
+python - <<'INSTALL'
+from pathlib import Path
+import os
+import shutil
+import executorch.backends.qualcomm.python as qnn_python
+for source in (Path(os.environ['EXECUTORCH_ROOT']) / 'build-x86/backends/qualcomm').glob('Py*.so'):
+    shutil.copy2(source, Path(next(iter(qnn_python.__path__))) / source.name)
+from executorch.backends.qualcomm.utils.utils import generate_htp_compiler_spec
+print('QNN AOT bindings ready')
+INSTALL
+bash android/build_runner.sh host
+bash android/build_runner.sh android

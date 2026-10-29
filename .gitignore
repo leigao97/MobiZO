@@ -1,3 +1,7 @@
 __pycache__
 wandb
 *.pyc
+.venv-android/
+.tools/
+artifacts/
+.pytest_cache/

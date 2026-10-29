@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from torch import nn
 
-from models.lora_android import LoRAInt8Linear
+from .lora_android import MobileLoRALinear, project
 
 @dataclass
 class ModelArgs:
@@ -15,8 +15,8 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = 32000  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    vocab_size: int = 32000
+    multiple_of: int = 256
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
@@ -26,52 +26,19 @@ class ModelArgs:
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
-        """
-        Initialize the RMSNorm normalization layer.
-
-        Args:
-            dim (int): The dimension of the input tensor.
-            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-
-        Attributes:
-            eps (float): A small value added to the denominator for numerical stability.
-            weight (nn.Parameter): Learnable scaling parameter.
-
-        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
-        """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-
-        """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -131,10 +98,8 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
         self.q_proj = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        # self.wq_lora = LoRAInt8Linear(args.dim, args.n_heads * self.head_dim, r=8, lora_alpha=16)
         self.k_proj = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        # self.wv_lora = LoRAInt8Linear(args.dim, self.n_kv_heads * self.head_dim, r=8, lora_alpha=16)
         self.o_proj = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
@@ -146,24 +111,23 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        state=None, noise=None, eps=None,
     ):
         bsz, seqlen, _ = x.shape
 
-        # QKV
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = project(self.q_proj, x, state, noise, eps)
+        xk = project(self.k_proj, x, state, noise, eps)
+        xv = project(self.v_proj, x, state, noise, eps)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        # RoPE relative positional embeddings
         xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
 
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
@@ -171,13 +135,13 @@ class Attention(nn.Module):
         assert hasattr(self, "mask")
         scores = (
             scores + self.mask[:, :, :seqlen, :seqlen]
-        )  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        )
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, xv)
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
-        output = self.o_proj(output)
+        output = project(self.o_proj, output, state, noise, eps)
         return output
 
 
@@ -190,8 +154,10 @@ class FeedForward(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, state=None, noise=None, eps=None):
+        gate = project(self.gate_proj, x, state, noise, eps)
+        up = project(self.up_proj, x, state, noise, eps)
+        return project(self.down_proj, F.silu(gate) * up, state, noise, eps)
 
 
 class TransformerBlock(nn.Module):
@@ -210,9 +176,9 @@ class TransformerBlock(nn.Module):
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.self_attn.forward(self.input_layernorm(x), freqs_cos, freqs_sin)
-        out = h + self.mlp.forward(self.post_attention_layernorm(h))
+    def forward(self, x, freqs_cos, freqs_sin, state=None, noise=None, eps=None):
+        h = x + self.self_attn(self.input_layernorm(x), freqs_cos, freqs_sin, state, noise, eps)
+        out = h + self.mlp(self.post_attention_layernorm(h), state, noise, eps)
         return out
 
 
@@ -237,15 +203,14 @@ class Transformer(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, state=None, noise=None, eps=None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.embed_tokens(tokens)
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
         for layer in self.layers:
-            h = layer(h, freqs_cos, freqs_sin)
-        # h = self.layers[0](h, freqs_cos, freqs_sin) # myuan: hack one layer for debug
+            h = layer(h, freqs_cos, freqs_sin, state, noise, eps)
 
         h = self.norm(h)
 
@@ -256,11 +221,30 @@ class Llama2Model(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.model = Transformer(params)
-        
+
         self.lm_head = nn.Linear(params.dim, params.vocab_size, bias=False)
-    
-    def forward(self, x):
-        h = self.model(x)
+
+    def enable_lora(self, rank=16, alpha=32, targets=None):
+        targets = set(targets or ("q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"))
+        self.adapter_layout = []
+        offset = 0
+        for name, layer in list(self.named_modules()):
+            if isinstance(layer, nn.Linear) and name.rsplit(".", 1)[-1] in targets:
+                parent_name, child_name = name.rsplit(".", 1)
+                wrapper = MobileLoRALinear(layer, rank, alpha, offset)
+                setattr(self.get_submodule(parent_name), child_name, wrapper)
+                self.adapter_layout.append(dict(name=name, offset=offset,
+                                                shape=[rank, layer.out_features]))
+                offset += wrapper.numel
+        if not offset:
+            raise ValueError("No LoRA target modules matched")
+        self.requires_grad_(False)
+        self.adapter_numel = offset
+        return offset
+
+    def forward(self, x, state=None, noise=None, eps=None):
+        h = self.model(x, state, noise, eps)
         logits = self.lm_head(h)
 
         return logits

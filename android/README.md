@@ -1,50 +1,70 @@
-# Android Environment Setup with ExecuTorch
+# Android MobiZO training
 
-### Step 1: Create Conda Environment
+Tested with TinyLlama on OnePlus 12 (Snapdragon 8 Gen 3), ExecuTorch 1.0.1,
+QNN 2.37.0.250724, and Android NDK r26d.
 
-```bash
-conda create -n android python=3.11
-conda activate android
-```
+The base model and LoRA A stay frozen. LoRA B is a runtime input/output:
+the transformer and LoRA forward run on HTP in FP16; cross-entropy, the
+two-sided ZO gradient estimate, and the B update run on CPU in FP32.
+The runner generates noise on the phone and saves B in a separate checkpoint.
 
-### Step 2: Download ExecuTorch (v0.6)
-```bash
-git clone -b release/0.6 https://github.com/pytorch/executorch.git
-```
+## Build
 
-### Step 2: Install Qualcomm AI Engine Direct SDK and Android NDK
-Download Qualcomm AI Engine Direct SDK [QNN 2.28.0.241029](https://softwarecenter.qualcomm.com/api/download/software/qualcomm_neural_processing_sdk/v2.28.0.241029.zip) and Android NDK [r26d](https://github.com/android/ndk/releases).
-
-### Step 3: Set Environment Variables
-Change the `QNN_SDK_ROOT` and `ANDROID_NDK_ROOT` path accordingly. 
-```bash
-export QNN_SDK_ROOT=/absolute_path_to/qairt/2.28.0.241029
-export ANDROID_NDK_ROOT=/absolute_path_to/android-ndk-r26d
-
-export LD_LIBRARY_PATH=$QNN_SDK_ROOT/lib/x86_64-linux-clang/:$LD_LIBRARY_PATH
-export EXECUTORCH_ROOT=/absolute_path_to/executorch
-export PYTHONPATH=$EXECUTORCH_ROOT/..
-```
-
-### Step 4: Build ExecuTorch
+On Linux x86_64, install `uv`, Git, GCC, make, and curl. Run from the repository
+root (the setup script uses Ubuntu apt packages for local LLVM runtime libraries):
 
 ```bash
-sh build.sh
+bash android/setup_host.sh
+source android/env.sh
+bash android/build.sh
 ```
 
-### Step 5: Connect Android Device
+## Export
+
+Download `TinyLlama/TinyLlama-1.1B-Chat-v1.0` from Hugging Face into
+`.tools/models/TinyLlama-1.1B-Chat-v1.0` (including `model.safetensors`).
 
 ```bash
-adb get-serialno
+python -m android.export_training \
+  --checkpoint .tools/models/TinyLlama-1.1B-Chat-v1.0 \
+  --seq-len 128 --batch-size 1 --rank 16 --alpha 32 \
+  --output artifacts/tinyllama-qnn
 ```
 
-### Step 6: Run Compile & Offload Script
+`--batch-size` is effective batch E; the positive/negative branches use 2E sequences.
+`--qnn-shards` defaults to 1. For large batches, use 2 (S=64/E=16 or S=128/E=8)
+or 4 (S=128/E=16) to fit QNN context memory limits.
+
+The bundle includes a synthetic example batch. Replace `tokens.bin` and
+`labels.bin` with row-major int32 arrays of shape `[E, S]` for your data.
+Labels use unshifted token positions; `-100` masks ignored targets.
+This basic runner repeats the supplied batch; dataset iteration is not included.
+
+## Run and resume
+
+Connect the phone with USB debugging enabled, then copy the bundle and runtime:
+
 ```bash
-python qnn.py -s 7500709c -m SM8650 -b $EXECUTORCH_ROOT/build-android
+adb shell mkdir -p /data/local/tmp/mobizo
+adb push artifacts/tinyllama-qnn artifacts/build-android/mobizo_train \
+  "$EXECUTORCH_ROOT/build-android/lib/libqnn_executorch_backend.so" \
+  "$QNN_SDK_ROOT"/lib/aarch64-android/{libQnnHtp.so,libQnnSystem.so,libQnnHtpV75Stub.so,libQnnHtpPrepare.so,libQnnModelDlc.so} \
+  "$QNN_SDK_ROOT/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so" /data/local/tmp/mobizo/
 ```
 
-* -s: Device serial number
-* -m: SoC identifier
-* -b: Path to the Android build directory for ExecuTorch
+Inside `adb shell`:
 
-### Check detailed tutorial from [ExecuTorch](https://pytorch.org/executorch/stable/build-run-qualcomm-ai-engine-direct-backend.html)
+```sh
+cd /data/local/tmp/mobizo
+chmod +x mobizo_train
+export LD_LIBRARY_PATH="$PWD:/vendor/lib64"
+export ADSP_LIBRARY_PATH="$PWD;/vendor/lib/rfsa/adsp;/vendor/dsp"
+./mobizo_train --bundle ./tinyllama-qnn --steps 10 --checkpoint-out adapter.ckpt
+./mobizo_train --bundle ./tinyllama-qnn --steps 10 \
+  --checkpoint-in adapter.ckpt --checkpoint-out adapter.ckpt
+```
+
+Keep the same PTE and manifest when resuming. Updated weights are saved in
+`adapter.ckpt`, not written back into the PTE. Each step logs losses, B's change
+norm, and latency. Optional `--warmup N` excludes N initial steps from the timing
+average; those steps still update B.

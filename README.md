@@ -35,3 +35,6 @@ sh experiments/zo/llama2-7b/all.sh
 ```
 
 ### Step 3: Check `android` Folder for On-device Experiments 
+
+See [the Android guide](android/README.md) to build and run MobiZO training
+with ExecuTorch/QNN, including adapter checkpoint save and resume.
