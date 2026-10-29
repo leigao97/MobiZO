@@ -157,7 +157,9 @@ class FeedForward(nn.Module):
     def forward(self, x, state=None, noise=None, eps=None):
         gate = project(self.gate_proj, x, state, noise, eps)
         up = project(self.up_proj, x, state, noise, eps)
-        return project(self.down_proj, F.silu(gate) * up, state, noise, eps)
+        # Avoid the less accurate fused SiLU path on QNN HTP.
+        activated = gate * (0.5 + 0.5 * torch.tanh(0.5 * gate))
+        return project(self.down_proj, activated * up, state, noise, eps)
 
 
 class TransformerBlock(nn.Module):
